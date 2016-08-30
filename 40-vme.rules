@@ -1,0 +1,3 @@
+
+SUBSYSTEM=="vme", GROUP="users", MODE="666"
+

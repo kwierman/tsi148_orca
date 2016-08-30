@@ -1,0 +1,266 @@
+#include "TUVMEDevice.hh"
+#include <sstream>
+#include <sys/ioctl.h>
+#include <sys/fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include <stdlib.h>
+
+extern "C" {
+#include <libvmebus.h>
+}
+
+TUVMEDeviceLock TUVMEDevice::fSystemLock;
+
+TUVMEDevice::TUVMEDevice(uint32_t devNumber)
+{
+  Reset();
+  fIsOpen = false;
+  fFileNum = -1;
+  fDevNumber = devNumber;
+}
+
+TUVMEDevice::~TUVMEDevice()
+{
+	Close();
+}
+
+int32_t TUVMEDevice::Open()  
+{
+  std::ostringstream os;
+  if (fDevNumber >= (int32_t)kNumberOfDevices) {
+    return -1; //Error
+  } 
+  os << "/dev/"<< GetDeviceStringName();
+
+	if ((fFileNum = open(os.str().c_str(), O_RDWR)) < 0) {
+		fIsOpen = false;
+		return fFileNum; // Error
+	}
+
+	close(fFileNum);
+	fIsOpen = true;
+	return 0;
+}
+
+int32_t TUVMEDevice::Enable()
+{
+	if (fModified) {
+		if (fMappedAddress) {
+			vme_unmap(&fDesc, 1);
+			fMappedAddress = NULL;
+		}
+		memset(&fDesc, 0, sizeof(struct vme_mapping));
+
+		fDesc.window_num = fDevNumber;
+		fDesc.am = fAddressModifier;
+		fDesc.read_prefetch_enabled = 0;
+		switch (fDataWidth) {
+			case VME_D8:
+			case VME_D16:
+				fDesc.data_width = VME_D16;
+				break;
+			case VME_D32:
+				fDesc.data_width = VME_D32;
+				break;
+			case VME_D64:
+				fDesc.data_width = VME_D64;
+				break;
+			default:
+				break;
+		}
+		fDesc.sizeu = 0;
+		if ((fAddressModifier == VME_A16_USER || fAddressModifier == VME_A16_SUP ||
+			fAddressModifier == VME_A16_LCK) && fSizeOfImage > 0x10000)
+			fSizeOfImage = 0x10000;
+		fDesc.sizel = fSizeOfImage;
+		fDesc.vme_addru = 0;
+		fDesc.vme_addrl = fVMEAddress;
+		if ((fMappedAddress = vme_map(&fDesc, 1)) == NULL) {
+			return -1;
+		}
+		fModified = false;
+	}
+
+	return 0;
+}
+
+void TUVMEDevice::Close() 
+{
+  if (fIsOpen) {
+    fIsOpen = false;
+  }
+	if (fMappedAddress) {
+		vme_unmap(&fDesc, 1);
+		fMappedAddress = NULL;
+		Reset();
+	}
+}
+
+void TUVMEDevice::SetVMEAddress(uint32_t vmeAddress)
+{
+	if (fVMEAddress != vmeAddress) {
+		fVMEAddress = vmeAddress;
+		fModified = true;
+	}
+}	
+
+void TUVMEDevice::SetSizeOfImage(uint32_t sizeOfImage)
+{
+	if (fSizeOfImage != sizeOfImage) {
+		fSizeOfImage = sizeOfImage;
+		fModified = true;
+	}
+}
+
+int32_t TUVMEDevice::SetWithAddressModifier(uint32_t addressModifier)
+{
+	if (fAddressModifier != (enum vme_address_modifier) addressModifier) {
+		fAddressModifier = (enum vme_address_modifier) addressModifier;
+		fModified = true;
+	}
+	return 0;
+}
+
+void TUVMEDevice::SetDataWidth(ETUVMEDeviceDataWidth dataWidth)
+{
+	if (fDataWidth != (enum vme_data_width) (8 * dataWidth)) {
+		fDataWidth = (enum vme_data_width) (8 * dataWidth);
+		fModified = true;
+	}
+}
+
+#define swapShort(x) (((uint16_t)(x) <<  8) | ((uint16_t)(x)>>  8))
+#define swapLong(x) (((uint32_t)(x) << 24) | (((uint32_t)(x) & 0x0000FF00) <<  8) | (((uint32_t)(x) & 0x00FF0000) >>  8) | ((uint32_t)(x) >> 24))
+#define swapLongLong(x) (((uint64_t)(x)) << 56) |                                       \
+			((((uint64_t)(x)) & (uint64_t)0x000000000000FF00ULL) << 40) |   \
+			((((uint64_t)(x)) & (uint64_t)0x0000000000FF0000ULL) << 24) |   \
+			((((uint64_t)(x)) & (uint64_t)0x00000000FF000000ULL) <<  8) |   \
+			((((uint64_t)(x)) & (uint64_t)0x000000FF00000000ULL) >>  8) |   \
+			((((uint64_t)(x)) & (uint64_t)0x0000FF0000000000ULL) >> 24) |   \
+			((((uint64_t)(x)) & (uint64_t)0x00FF000000000000ULL) >> 40) |   \
+			(((uint64_t)(x)) >> 56)
+
+static void swapShortBlock(void* p, int32_t n)
+{
+        int16_t* sp = (int16_t*)p;
+        int32_t i;
+        for(i=0;i<n;i++){
+                int16_t x = *sp;
+                *sp =  (((uint16_t)(x)) << 8) |    
+                        (((uint16_t)(x)) >> 8) ;
+                sp++;
+        }
+}
+
+static void swapLongBlock(void* p, int32_t n)
+{
+        int32_t* lp = (int32_t*)p;
+        int32_t i;
+        for(i=0;i<n;i++){
+                int32_t x = *lp;
+                *lp = (((uint32_t)(x)) << 24) |    
+                        (((uint32_t)(x) & (uint32_t)0x0000FF00) <<  8) |    
+                        (((uint32_t)(x) & (uint32_t)0x00FF0000) >>  8) |    
+                        (((uint32_t)(x)) >> 24);
+                lp++;
+        }
+}
+
+int32_t TUVMEDevice::Read(char* buffer, uint32_t numBytes, uint32_t offset)
+{
+	if (!fIsOpen) return 0; 
+	if (fModified) {
+		if (Enable()) return 0;
+	}
+
+	int32_t checker = 0;
+	
+        if ( fMappedAddress ) {
+	        void* read_buf;
+	        if (posix_memalign((void **)&read_buf, (size_t) 4096, (size_t) numBytes + 8)) {
+        	        return 0;
+        	}
+	        memset(read_buf, 0, (size_t) numBytes + 8);
+
+		fSystemLock.Lock();
+		memcpy(read_buf, (char*)fMappedAddress + offset, numBytes); 
+		checker = vme_bus_error_check(&fDesc);
+		fSystemLock.Unlock();
+
+		switch (fDataWidth) {
+			case VME_D8:
+				//*buffer = *(char*) read_buf;
+				break;
+			case VME_D16:
+				//*(uint16_t*) buffer = swapShort(*(uint16_t*) read_buf);
+				//this should really go through DMA
+				swapShortBlock(read_buf, numBytes/2);
+				break;
+			case VME_D32:
+				//*(uint32_t*) buffer = swapLongBlock(*(uint32_t*) read_buf,  numBytes/4);
+				swapLongBlock(read_buf, numBytes/4);
+				break;
+			case VME_D64:
+				//*(uint64_t*) buffer = swapLongLong(*(uint64_t*) read_buf);
+				//UniverseII compatibility!, to be fixed
+				swapLongBlock(read_buf, numBytes/4);
+				break;
+		}
+
+        	memcpy((void*) buffer, read_buf, numBytes);
+		free(read_buf);
+		if ( checker == 0 ) return numBytes;
+	}
+
+	return 0;
+}
+
+int32_t TUVMEDevice::Write(char* buffer, uint32_t numBytes, uint32_t offset)
+{
+	if (!fIsOpen) return 0; 
+
+	if (fModified) {
+		if (Enable()) return 0;
+	}
+
+	int32_t checker = 0;
+        if ( fMappedAddress ) {
+	        void* read_buf;
+	        if (posix_memalign((void **)&read_buf, (size_t) 4096, (size_t) numBytes + 8)) {
+        	        return 0;
+        	}
+	        memset(read_buf, 0, (size_t) numBytes + 8);
+	        memcpy(read_buf, (void*) buffer, numBytes);
+
+		switch (fDesc.data_width) {
+			case VME_D8:
+				//*read_buf = *(char*) buffer;
+				break;
+			case VME_D16:
+				//*(uint16_t*) read_buf = swapShort(*(uint16_t*) buffer);
+				swapShortBlock(read_buf, numBytes/2);
+				break;
+			case VME_D32:
+				//*(uint32_t*) read_buf = swapLong(*(uint32_t*) buffer);
+				swapLongBlock(read_buf, numBytes/4);
+				break;
+			case VME_D64:
+				//*(uint64_t*) read_buf = swapLongLong(*(uint64_t*) buffer);
+				//UniverseII compatibility!
+				swapLongBlock(read_buf, numBytes/4);
+				break;
+		}
+
+		fSystemLock.Lock();
+		memcpy((char*)fMappedAddress + offset, read_buf, numBytes); 
+		checker = vme_bus_error_check(&fDesc);
+		fSystemLock.Unlock();
+
+		free(read_buf);
+		if ( checker == 0 ) return numBytes;
+	}
+
+	return 0;
+}
+
